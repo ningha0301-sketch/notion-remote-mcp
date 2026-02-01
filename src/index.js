@@ -1,272 +1,170 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
+import { streamSSE } from 'hono/streaming';
 import { Client } from '@notionhq/client';
 
 const app = new Hono();
 
-// OpenAI Agent Builder가 접속할 수 있도록 CORS 허용
+// CORS 및 접속 허용
 app.use('/*', cors());
 
-/**
- * 1. 동적 OpenAPI 스키마 생성 (Agent Builder가 읽어갈 문서)
- * - 접속한 도메인(host)을 자동으로 감지해서 스키마에 넣습니다.
- */
-app.get('/openapi.json', (c) => {
-  const host = c.req.header('host');
-  const protocol = host.includes('localhost') ? 'http' : 'https';
-  
-  return c.json({
-    openapi: "3.1.0",
-    info: {
-      title: "Notion Tool",
-      description: "노션 페이지를 검색, 읽기, 쓰기, 수정하는 도구입니다.",
-      version: "1.0.0"
-    },
-    servers: [
-      {
-        url: `${protocol}://${host}`,
-        description: "Notion Worker Server"
-      }
-    ],
-    paths: {
-      "/search": {
-        post: {
-          operationId: "searchNotion",
-          summary: "노션 검색",
-          description: "키워드로 노션 페이지를 검색합니다.",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    query: { type: "string", description: "검색할 키워드" }
-                  },
-                  required: ["query"]
-                }
-              }
-            }
-          },
-          responses: { "200": { description: "성공" } }
-        }
+// ---------------------------------------------------------
+// 1. 도구 정의 (Notion Tool Definitions)
+// ---------------------------------------------------------
+const TOOLS = [
+  {
+    name: "search_notion",
+    description: "Search for pages in Notion by title.",
+    inputSchema: {
+      type: "object",
+      properties: { query: { type: "string" } },
+      required: ["query"]
+    }
+  },
+  {
+    name: "read_page",
+    description: "Read content of a Notion page.",
+    inputSchema: {
+      type: "object",
+      properties: { page_id: { type: "string" } },
+      required: ["page_id"]
+    }
+  },
+  {
+    name: "write_page",
+    description: "Create a new page in Notion.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        database_id: { type: "string" },
+        title: { type: "string" },
+        content: { type: "string" }
       },
-      "/read": {
-        post: {
-          operationId: "readPage",
-          summary: "페이지 읽기",
-          description: "페이지 ID로 내용을 읽어옵니다.",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    page_id: { type: "string", description: "페이지 ID" }
-                  },
-                  required: ["page_id"]
-                }
-              }
-            }
-          },
-          responses: { "200": { description: "성공" } }
-        }
-      },
-      "/write": {
-        post: {
-          operationId: "writePage",
-          summary: "페이지 생성",
-          description: "새 페이지를 만듭니다.",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    database_id: { type: "string", description: "데이터베이스 ID" },
-                    title: { type: "string", description: "제목" },
-                    content: { type: "string", description: "본문 내용" }
-                  },
-                  required: ["database_id", "title", "content"]
-                }
-              }
-            }
-          },
-          responses: { "200": { description: "성공" } }
-        }
-      },
-      "/append": {
-        post: {
-          operationId: "appendContent",
-          summary: "내용 추가",
-          description: "기존 페이지 하단에 내용을 추가합니다.",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    page_id: { type: "string", description: "페이지 ID" },
-                    content: { type: "string", description: "추가할 내용" }
-                  },
-                  required: ["page_id", "content"]
-                }
-              }
-            }
-          },
-          responses: { "200": { description: "성공" } }
-        }
-      },
-      "/comment": {
-        post: {
-          operationId: "addComment",
-          summary: "댓글 달기",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    page_id: { type: "string", description: "페이지 ID" },
-                    text: { type: "string", description: "댓글 내용" }
-                  },
-                  required: ["page_id", "text"]
-                }
-              }
-            }
-          },
-          responses: { "200": { description: "성공" } }
-        }
-      },
-      "/status": {
-        post: {
-          operationId: "updateStatus",
-          summary: "상태 변경",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    page_id: { type: "string", description: "페이지 ID" },
-                    property_name: { type: "string", description: "상태 속성 이름" },
-                    status_name: { type: "string", description: "변경할 상태 값" }
-                  },
-                  required: ["page_id", "property_name", "status_name"]
-                }
-              }
-            }
-          },
-          responses: { "200": { description: "성공" } }
-        }
-      },
-      "/archive": {
-        post: {
-          operationId: "archivePage",
-          summary: "페이지 삭제",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    page_id: { type: "string", description: "페이지 ID" }
-                  },
-                  required: ["page_id"]
-                }
-              }
-            }
-          },
-          responses: { "200": { description: "성공" } }
-        }
-      }
+      required: ["database_id", "title", "content"]
+    }
+  }
+];
+
+// ---------------------------------------------------------
+// 2. MCP 프로토콜 엔드포인트 구현
+// ---------------------------------------------------------
+
+// [SSE 엔드포인트] 연결을 맺고 세션을 시작하는 곳
+app.get('/sse', async (c) => {
+  return streamSSE(c, async (stream) => {
+    console.log("Agent Connected via SSE");
+
+    // MCP 표준: 연결되자마자 'endpoint' 이벤트를 보내서 POST 주소를 알려줘야 함
+    const url = new URL(c.req.url);
+    const messageEndpoint = `${url.origin}/messages`;
+    
+    await stream.writeSSE({
+      event: 'endpoint',
+      data: messageEndpoint
+    });
+
+    // 연결 유지 (무한 루프)
+    while (true) {
+      await stream.sleep(10000); // 10초마다 대기 (연결 끊김 방지)
     }
   });
 });
 
-/**
- * 2. 실제 기능 구현 (REST API)
- */
-app.post('/search', async (c) => {
-  try {
-    const notion = new Client({ auth: c.env.NOTION_KEY });
-    const { query } = await c.req.json();
-    const res = await notion.search({ query, page_size: 5, sort: { direction: 'descending', timestamp: 'last_edited_time' } });
-    const text = res.results.map(i => {
-      const title = i.properties?.Name?.title?.[0]?.plain_text || i.properties?.title?.title?.[0]?.plain_text || "제목없음";
-      return `- [${title}] (ID: ${i.id})`;
-    }).join('\n');
-    return c.json({ result: text || "검색 결과 없음" });
-  } catch (e) { return c.json({ error: e.message }, 500); }
-});
+// [메시지 엔드포인트] 실제 명령(JSON-RPC)을 처리하는 곳
+app.post('/messages', async (c) => {
+  const notionKey = c.env.NOTION_KEY;
+  if (!notionKey) return c.json({ error: "Missing NOTION_KEY" }, 500);
+  
+  const notion = new Client({ auth: notionKey });
+  const body = await c.req.json();
+  const { jsonrpc, method, params, id } = body;
 
-app.post('/read', async (c) => {
-  try {
-    const notion = new Client({ auth: c.env.NOTION_KEY });
-    const { page_id } = await c.req.json();
-    const blocks = await notion.blocks.children.list({ block_id: page_id, page_size: 100 });
-    const text = blocks.results.map(b => b[b.type]?.rich_text?.map(t => t.plain_text).join("") || "").join("\n");
-    return c.json({ result: text || "내용 없음" });
-  } catch (e) { return c.json({ error: e.message }, 500); }
-});
+  console.log(`Received Method: ${method}`);
 
-app.post('/write', async (c) => {
-  try {
-    const notion = new Client({ auth: c.env.NOTION_KEY });
-    const { database_id, title, content } = await c.req.json();
-    await notion.pages.create({
-      parent: { database_id },
-      properties: { title: { title: [{ text: { content: title } }] } },
-      children: [{ object: 'block', type: 'paragraph', paragraph: { rich_text: [{ text: { content } }] } }]
+  // 1. Initialize (악수 요청): 클라이언트가 "너 누구야? 통신하자"고 할 때
+  if (method === 'initialize') {
+    return c.json({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        protocolVersion: "2024-11-05", // MCP 최신 버전 명시
+        capabilities: {
+          tools: {} // "나 도구 기능 있어"라고 선언
+        },
+        serverInfo: {
+          name: "notion-mcp-worker",
+          version: "1.0.0"
+        }
+      }
     });
-    return c.json({ result: "생성 완료" });
-  } catch (e) { return c.json({ error: e.message }, 500); }
-});
+  }
 
-app.post('/append', async (c) => {
-  try {
-    const notion = new Client({ auth: c.env.NOTION_KEY });
-    const { page_id, content } = await c.req.json();
-    await notion.blocks.children.append({
-      block_id: page_id,
-      children: [{ object: 'block', type: 'paragraph', paragraph: { rich_text: [{ text: { content } }] } }]
+  // 2. Initialized (악수 완료): 클라이언트가 "그래 확인했어"라고 보낼 때 (응답 불필요)
+  if (method === 'notifications/initialized') {
+    return c.json({ jsonrpc: "2.0", id: null });
+  }
+
+  // 3. Ping: 연결 살아있는지 확인할 때
+  if (method === 'ping') {
+    return c.json({ jsonrpc: "2.0", id, result: {} });
+  }
+
+  // 4. Tools List: "무슨 도구 있어?"라고 물어볼 때
+  if (method === 'tools/list') {
+    return c.json({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        tools: TOOLS
+      }
     });
-    return c.json({ result: "추가 완료" });
-  } catch (e) { return c.json({ error: e.message }, 500); }
-});
+  }
 
-app.post('/comment', async (c) => {
-  try {
-    const notion = new Client({ auth: c.env.NOTION_KEY });
-    const { page_id, text } = await c.req.json();
-    await notion.comments.create({ parent: { page_id }, rich_text: [{ text: { content: text } }] });
-    return c.json({ result: "댓글 완료" });
-  } catch (e) { return c.json({ error: e.message }, 500); }
-});
+  // 5. Call Tool: 실제로 도구를 사용할 때
+  if (method === 'tools/call') {
+    const { name, arguments: args } = params;
+    let contentResult = "";
 
-app.post('/status', async (c) => {
-  try {
-    const notion = new Client({ auth: c.env.NOTION_KEY });
-    const { page_id, property_name, status_name } = await c.req.json();
-    const props = {}; props[property_name] = { status: { name: status_name } };
-    await notion.pages.update({ page_id, properties: props });
-    return c.json({ result: "상태 변경 완료" });
-  } catch (e) { return c.json({ error: e.message }, 500); }
-});
+    try {
+      if (name === 'search_notion') {
+        const res = await notion.search({ query: args.query, page_size: 3 });
+        contentResult = res.results.map(i => 
+          `- ${i.properties?.Name?.title?.[0]?.plain_text || "제목없음"} (ID: ${i.id})`
+        ).join('\n') || "검색 결과 없음";
+      } 
+      else if (name === 'read_page') {
+        const blocks = await notion.blocks.children.list({ block_id: args.page_id, page_size: 50 });
+        contentResult = blocks.results.map(b => b[b.type]?.rich_text?.map(t => t.plain_text).join("") || "").join("\n");
+      }
+      else if (name === 'write_page') {
+        await notion.pages.create({
+          parent: { database_id: args.database_id },
+          properties: { title: { title: [{ text: { content: args.title } }] } },
+          children: [{ object: 'block', type: 'paragraph', paragraph: { rich_text: [{ text: { content: args.content } }] } }]
+        });
+        contentResult = "페이지 생성 완료";
+      }
+      else {
+        throw new Error("Unknown tool");
+      }
 
-app.post('/archive', async (c) => {
-  try {
-    const notion = new Client({ auth: c.env.NOTION_KEY });
-    const { page_id } = await c.req.json();
-    await notion.pages.update({ page_id, archived: true });
-    return c.json({ result: "삭제 완료" });
-  } catch (e) { return c.json({ error: e.message }, 500); }
+      return c.json({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          content: [{ type: "text", text: contentResult }]
+        }
+      });
+    } catch (error) {
+      return c.json({
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32000, message: error.message }
+      });
+    }
+  }
+
+  return c.json({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } });
 });
 
 export default app;
