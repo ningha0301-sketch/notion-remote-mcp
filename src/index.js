@@ -7,7 +7,7 @@ const app = new Hono();
 app.use('/*', cors());
 
 // ==========================================
-// 🛠️ 도구 정의 (FastMCP처럼 여기만 고치세요)
+// 🛠️ 도구 정의
 // ==========================================
 const toolDefinitions = [
   {
@@ -18,7 +18,6 @@ const toolDefinitions = [
       properties: { query: { type: "string" } },
       required: ["query"]
     },
-    // 실제 실행될 함수
     execute: async (args, env) => {
       const notion = new Client({ auth: env.NOTION_KEY });
       const res = await notion.search({ query: args.query, page_size: 5 });
@@ -48,28 +47,21 @@ const toolDefinitions = [
       });
       return "페이지 작성 완료";
     }
-  },
-  // 필요한 도구 계속 추가 가능...
+  }
 ];
 
-
 // ==========================================
-// ⚙️ MCP 서버 코어 (건드리지 마세요)
+// ⚙️ MCP 서버 코어
 // ==========================================
 
-// 1. SSE 연결 (심장박동)
 app.get('/sse', async (c) => {
   return streamSSE(c, async (stream) => {
-    console.log("🔗 Agent Connected");
-    
-    // 연결되자마자 POST 주소 알려주기 (MCP 필수 규약)
+    console.log("🔗 Agent Connected via SSE");
     const url = new URL(c.req.url);
     await stream.writeSSE({
       event: 'endpoint',
       data: `${url.origin}/messages`
     });
-
-    // 연결 끊기지 않게 주기적으로 신호 보냄
     while (true) {
       await stream.sleep(10000); 
       await stream.writeSSE({ event: 'ping', data: '' });
@@ -77,13 +69,22 @@ app.get('/sse', async (c) => {
   });
 });
 
-// 2. 메시지 처리 (뇌)
 app.post('/messages', async (c) => {
+  // [디버깅] 환경변수 체크
+  if (!c.env.NOTION_KEY) {
+    console.error("❌ Critical: NOTION_KEY is missing in Cloudflare Environment Variables.");
+    return c.json({ jsonrpc: "2.0", id: null, error: { code: -32603, message: "Server Misconfiguration: NOTION_KEY missing" } }, 500);
+  }
+
   try {
     const body = await c.req.json();
-    const { method, params, id } = body;
+    const { method, id } = body;
+    // [방어 로직] params가 없으면 빈 객체로 처리 (initialized 메시지 등에서 터지는 것 방지)
+    const params = body.params || {};
 
-    // 초기화 요청 (악수)
+    console.log(`📩 Received Method: ${method}`);
+
+    // 1. Initialize
     if (method === 'initialize') {
       return c.json({
         jsonrpc: "2.0",
@@ -96,7 +97,12 @@ app.post('/messages', async (c) => {
       });
     }
 
-    // 도구 목록 달라고 할 때
+    // 2. Initialized (응답 없음)
+    if (method === 'notifications/initialized') {
+      return c.json({ jsonrpc: "2.0", id: null });
+    }
+
+    // 3. Tools List
     if (method === 'tools/list') {
       return c.json({
         jsonrpc: "2.0",
@@ -111,13 +117,13 @@ app.post('/messages', async (c) => {
       });
     }
 
-    // 도구 실행하라고 할 때
+    // 4. Call Tool
     if (method === 'tools/call') {
       const tool = toolDefinitions.find(t => t.name === params.name);
-      if (!tool) throw new Error("도구를 찾을 수 없습니다.");
+      if (!tool) throw new Error(`Unknown tool: ${params.name}`);
 
-      // 도구 실행
-      const resultText = await tool.execute(params.arguments, c.env);
+      console.log(`🔨 Executing tool: ${params.name}`);
+      const resultText = await tool.execute(params.arguments || {}, c.env); // args가 없을 경우 대비
       
       return c.json({
         jsonrpc: "2.0",
@@ -128,11 +134,12 @@ app.post('/messages', async (c) => {
       });
     }
 
-    // 기타 요청 (Ping 등)
+    // 5. Ping & Others
     return c.json({ jsonrpc: "2.0", id, result: {} });
 
   } catch (error) {
-    console.error(error);
+    console.error(`❌ Error in /messages: ${error.message}`);
+    // 에러 내용을 그대로 JSON으로 반환 (OpenAI 쪽에서 원인 확인 가능하게)
     return c.json({
       jsonrpc: "2.0",
       id: null,
