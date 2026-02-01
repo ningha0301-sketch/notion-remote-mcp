@@ -1,4 +1,4 @@
-name = "notion-mcp-ultimate"
+name = "notion-remote-mcp"
 main = "src/index.js"
 compatibility_date = "2024-02-01"
 compatibility_flags = ["nodejs_compat"]
