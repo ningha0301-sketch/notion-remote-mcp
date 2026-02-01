@@ -1,0 +1,7 @@
+name = "notion-mcp-ultimate"
+main = "src/index.js"
+compatibility_date = "2024-02-01"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
