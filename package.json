@@ -1,0 +1,12 @@
+{
+  "name": "notion-mcp-ultimate",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "hono": "^4.0.0",
+    "@notionhq/client": "^2.2.15"
+  }
+}
