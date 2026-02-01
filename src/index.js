@@ -4,35 +4,32 @@ import { streamSSE } from 'hono/streaming';
 import { Client } from '@notionhq/client';
 
 const app = new Hono();
-
-// CORS 및 접속 허용
 app.use('/*', cors());
 
-// ---------------------------------------------------------
-// 1. 도구 정의 (Notion Tool Definitions)
-// ---------------------------------------------------------
-const TOOLS = [
+// ==========================================
+// 🛠️ 도구 정의 (FastMCP처럼 여기만 고치세요)
+// ==========================================
+const toolDefinitions = [
   {
     name: "search_notion",
-    description: "Search for pages in Notion by title.",
+    description: "노션 페이지 제목으로 검색",
     inputSchema: {
       type: "object",
       properties: { query: { type: "string" } },
       required: ["query"]
-    }
-  },
-  {
-    name: "read_page",
-    description: "Read content of a Notion page.",
-    inputSchema: {
-      type: "object",
-      properties: { page_id: { type: "string" } },
-      required: ["page_id"]
+    },
+    // 실제 실행될 함수
+    execute: async (args, env) => {
+      const notion = new Client({ auth: env.NOTION_KEY });
+      const res = await notion.search({ query: args.query, page_size: 5 });
+      return res.results.map(i => 
+        `- ${i.properties?.Name?.title?.[0]?.plain_text || "제목없음"} (ID: ${i.id})`
+      ).join('\n') || "검색 결과 없음";
     }
   },
   {
     name: "write_page",
-    description: "Create a new page in Notion.",
+    description: "노션에 새 페이지 작성",
     inputSchema: {
       type: "object",
       properties: {
@@ -41,130 +38,107 @@ const TOOLS = [
         content: { type: "string" }
       },
       required: ["database_id", "title", "content"]
+    },
+    execute: async (args, env) => {
+      const notion = new Client({ auth: env.NOTION_KEY });
+      await notion.pages.create({
+        parent: { database_id: args.database_id },
+        properties: { title: { title: [{ text: { content: args.title } }] } },
+        children: [{ object: 'block', type: 'paragraph', paragraph: { rich_text: [{ text: { content: args.content } }] } }]
+      });
+      return "페이지 작성 완료";
     }
-  }
+  },
+  // 필요한 도구 계속 추가 가능...
 ];
 
-// ---------------------------------------------------------
-// 2. MCP 프로토콜 엔드포인트 구현
-// ---------------------------------------------------------
 
-// [SSE 엔드포인트] 연결을 맺고 세션을 시작하는 곳
+// ==========================================
+// ⚙️ MCP 서버 코어 (건드리지 마세요)
+// ==========================================
+
+// 1. SSE 연결 (심장박동)
 app.get('/sse', async (c) => {
   return streamSSE(c, async (stream) => {
-    console.log("Agent Connected via SSE");
-
-    // MCP 표준: 연결되자마자 'endpoint' 이벤트를 보내서 POST 주소를 알려줘야 함
-    const url = new URL(c.req.url);
-    const messageEndpoint = `${url.origin}/messages`;
+    console.log("🔗 Agent Connected");
     
+    // 연결되자마자 POST 주소 알려주기 (MCP 필수 규약)
+    const url = new URL(c.req.url);
     await stream.writeSSE({
       event: 'endpoint',
-      data: messageEndpoint
+      data: `${url.origin}/messages`
     });
 
-    // 연결 유지 (무한 루프)
+    // 연결 끊기지 않게 주기적으로 신호 보냄
     while (true) {
-      await stream.sleep(10000); // 10초마다 대기 (연결 끊김 방지)
+      await stream.sleep(10000); 
+      await stream.writeSSE({ event: 'ping', data: '' });
     }
   });
 });
 
-// [메시지 엔드포인트] 실제 명령(JSON-RPC)을 처리하는 곳
+// 2. 메시지 처리 (뇌)
 app.post('/messages', async (c) => {
-  const notionKey = c.env.NOTION_KEY;
-  if (!notionKey) return c.json({ error: "Missing NOTION_KEY" }, 500);
-  
-  const notion = new Client({ auth: notionKey });
-  const body = await c.req.json();
-  const { jsonrpc, method, params, id } = body;
+  try {
+    const body = await c.req.json();
+    const { method, params, id } = body;
 
-  console.log(`Received Method: ${method}`);
-
-  // 1. Initialize (악수 요청): 클라이언트가 "너 누구야? 통신하자"고 할 때
-  if (method === 'initialize') {
-    return c.json({
-      jsonrpc: "2.0",
-      id,
-      result: {
-        protocolVersion: "2024-11-05", // MCP 최신 버전 명시
-        capabilities: {
-          tools: {} // "나 도구 기능 있어"라고 선언
-        },
-        serverInfo: {
-          name: "notion-mcp-worker",
-          version: "1.0.0"
-        }
-      }
-    });
-  }
-
-  // 2. Initialized (악수 완료): 클라이언트가 "그래 확인했어"라고 보낼 때 (응답 불필요)
-  if (method === 'notifications/initialized') {
-    return c.json({ jsonrpc: "2.0", id: null });
-  }
-
-  // 3. Ping: 연결 살아있는지 확인할 때
-  if (method === 'ping') {
-    return c.json({ jsonrpc: "2.0", id, result: {} });
-  }
-
-  // 4. Tools List: "무슨 도구 있어?"라고 물어볼 때
-  if (method === 'tools/list') {
-    return c.json({
-      jsonrpc: "2.0",
-      id,
-      result: {
-        tools: TOOLS
-      }
-    });
-  }
-
-  // 5. Call Tool: 실제로 도구를 사용할 때
-  if (method === 'tools/call') {
-    const { name, arguments: args } = params;
-    let contentResult = "";
-
-    try {
-      if (name === 'search_notion') {
-        const res = await notion.search({ query: args.query, page_size: 3 });
-        contentResult = res.results.map(i => 
-          `- ${i.properties?.Name?.title?.[0]?.plain_text || "제목없음"} (ID: ${i.id})`
-        ).join('\n') || "검색 결과 없음";
-      } 
-      else if (name === 'read_page') {
-        const blocks = await notion.blocks.children.list({ block_id: args.page_id, page_size: 50 });
-        contentResult = blocks.results.map(b => b[b.type]?.rich_text?.map(t => t.plain_text).join("") || "").join("\n");
-      }
-      else if (name === 'write_page') {
-        await notion.pages.create({
-          parent: { database_id: args.database_id },
-          properties: { title: { title: [{ text: { content: args.title } }] } },
-          children: [{ object: 'block', type: 'paragraph', paragraph: { rich_text: [{ text: { content: args.content } }] } }]
-        });
-        contentResult = "페이지 생성 완료";
-      }
-      else {
-        throw new Error("Unknown tool");
-      }
-
+    // 초기화 요청 (악수)
+    if (method === 'initialize') {
       return c.json({
         jsonrpc: "2.0",
         id,
         result: {
-          content: [{ type: "text", text: contentResult }]
+          protocolVersion: "2024-11-05",
+          capabilities: { tools: {} },
+          serverInfo: { name: "notion-worker", version: "1.0" }
         }
       });
-    } catch (error) {
+    }
+
+    // 도구 목록 달라고 할 때
+    if (method === 'tools/list') {
       return c.json({
         jsonrpc: "2.0",
         id,
-        error: { code: -32000, message: error.message }
+        result: {
+          tools: toolDefinitions.map(t => ({
+            name: t.name,
+            description: t.description,
+            inputSchema: t.inputSchema
+          }))
+        }
       });
     }
-  }
 
-  return c.json({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } });
+    // 도구 실행하라고 할 때
+    if (method === 'tools/call') {
+      const tool = toolDefinitions.find(t => t.name === params.name);
+      if (!tool) throw new Error("도구를 찾을 수 없습니다.");
+
+      // 도구 실행
+      const resultText = await tool.execute(params.arguments, c.env);
+      
+      return c.json({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          content: [{ type: "text", text: resultText }]
+        }
+      });
+    }
+
+    // 기타 요청 (Ping 등)
+    return c.json({ jsonrpc: "2.0", id, result: {} });
+
+  } catch (error) {
+    console.error(error);
+    return c.json({
+      jsonrpc: "2.0",
+      id: null,
+      error: { code: -32000, message: error.message }
+    }, 500);
+  }
 });
 
 export default app;
